@@ -10,14 +10,20 @@
 
 
 #########################################
-# LOCAL
 # CONFIG
 #########################################
 
 AUDIO_DEVICE_ID = 2                     # change this number to use another soundcard
 SAMPLES_DIR = "."                       # The root directory containing the sample-sets. Example: "/media/" to look for samples on a USB stick / SD card
 MAX_POLYPHONY = 10                      # This can be set higher, (80 is a safe value)
+LOCAL_CONFIG = 'local_config.py'	# Local config filename
+DEBUG = False                           # Enable to switch verbose logging on
 
+
+# Load local config if available
+import os.path
+if os.path.isfile(LOCAL_CONFIG):
+    execfile(LOCAL_CONFIG)
 
 #########################################
 # IMPORT
@@ -34,8 +40,8 @@ import threading
 from chunk import Chunk
 import struct
 import rtmidi_python as rtmidi
-import samplerbox_audio
-
+#import samplerbox_audio                         # legacy audio (pre RPi-2 models)
+import samplerbox_audio_neon as samplerbox_audio # ARM NEON instruction set
 
 #########################################
 # MIXER CLASSES
@@ -44,12 +50,13 @@ import samplerbox_audio
 
 class PlayingSound:
 
-    def __init__(self, sound, note):
+    def __init__(self, sound, note, velocity):
         self.sound = sound
         self.pos = 0
         self.fadeoutpos = 0
         self.isfadeout = False
         self.note = note
+        self.velocity = velocity
 
     def fadeout(self, i):
         self.isfadeout = True
@@ -79,8 +86,9 @@ class Sound:
 
         wf.close()
 
-    def play(self, note):
-        snd = PlayingSound(self, note)
+    def play(self, note, velocity):
+        actual_velocity = 1-globalvelocitysensitivity + (globalvelocitysensitivity * (velocity/127.0))
+        snd = PlayingSound(self, note, actual_velocity)
         playingsounds.append(snd)
         return snd
 
@@ -115,14 +123,14 @@ def AudioCallback(in_data, frame_count, time_info, status):
     global playingsounds
     rmlist = []
     playingsounds = playingsounds[-MAX_POLYPHONY:]
-    b = samplerbox_audio.mixaudiobuffers(playingsounds, rmlist, frame_count, FADEOUT, FADEOUTLENGTH, SPEED)
+    b = samplerbox_audio.mixaudiobuffers(playingsounds, rmlist, frame_count, FADEOUT, FADEOUTLENGTH, SPEED, globalvolume)
     for e in rmlist:
         try:
             playingsounds.remove(e)
         except:
             pass
-    b *= globalvolume
-    odata = (b.astype(numpy.int16)).tostring()
+#    odata = (b.astype(numpy.int16)).tostring()
+    odata = b.tostring()
     return (odata, pyaudio.paContinue)
 
 
@@ -138,7 +146,7 @@ def MidiCallback(message, time_stamp):
     if messagetype == 9:    # Note on
         midinote += globaltranspose
         try:
-            playingnotes.setdefault(midinote, []).append(samples[midinote, velocity].play(midinote))
+            playingnotes.setdefault(midinote, []).append(samples[midinote, velocity].play(midinote, velocity))
         except:
             pass
 
@@ -175,10 +183,12 @@ def ActuallyLoad():
     global samples
     global playingsounds
     global globalvolume, globaltranspose
+    global globalvelocitysensitivity
     playingsounds = []
     samples = {}
     globalvolume = 10 ** (-25.0/20)  # -25dB default global volume
     globaltranspose = 0
+    globalvelocitysensitivity = 0 # default midi velocity sensitivity
 
     basename = next((f for f in os.listdir(SAMPLES_DIR) if f.startswith("%d " % preset)), None)      # or next(glob.iglob("blah*"), None)
     if basename:
@@ -200,6 +210,9 @@ def ActuallyLoad():
                         continue
                     if r'%%transpose' in pattern:
                         globaltranspose = int(pattern.split('=')[1].strip())
+                        continue
+                    if r'%%velocitysensitivity' in pattern:
+                        globalvelocitysensitivity = float(pattern.split('=')[1].strip())
                         continue
                     defaultparams = {'midinote': '0', 'velocity': '127', 'notename': ''}
                     if len(pattern.split(',')) > 1:
