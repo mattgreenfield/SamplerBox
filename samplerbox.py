@@ -15,9 +15,13 @@
 
 AUDIO_DEVICE_ID = 2                     # change this number to use another soundcard
 SAMPLES_DIR = "."                       # The root directory containing the sample-sets. Example: "/media/" to look for samples on a USB stick / SD card
-MAX_POLYPHONY = 10                      # This can be set higher, (80 is a safe value)
 LOCAL_CONFIG = 'local_config.py'	# Local config filename
 DEBUG = False                           # Enable to switch verbose logging on
+USE_SERIALPORT_MIDI = False             # Set to True to enable MIDI IN via SerialPort (e.g. RaspberryPi's GPIO UART pins)
+USE_I2C_7SEGMENTDISPLAY = False         # Set to True to use a 7-segment display via I2C
+USE_BUTTONS = False                     # Set to True to use momentary buttons (connected to RaspberryPi's GPIO pins) to change preset
+MAX_POLYPHONY = 10                      # This can be set higher, (80 is a safe value)
+
 
 
 # Load local config if available
@@ -42,6 +46,14 @@ import struct
 import rtmidi_python as rtmidi
 #import samplerbox_audio                         # legacy audio (pre RPi-2 models)
 import samplerbox_audio_neon as samplerbox_audio # ARM NEON instruction set
+
+#########################################
+# SLIGHT MODIFICATION OF PYTHON'S WAVE MODULE
+# TO READ CUE MARKERS & LOOP MARKERS
+#########################################
+
+# Removed as not required for this project
+
 
 #########################################
 # MIXER CLASSES
@@ -109,8 +121,10 @@ SPEED = numpy.power(2, numpy.arange(0.0, 84.0)/12).astype(numpy.float32)
 
 samples = {}
 playingnotes = {}
+sustainplayingnotes = []
+sustain = False
 playingsounds = []
-globalvolume = 10 ** (-25.0/20)  # -25dB default global volume
+globalvolume = 10 ** (-24.0/20)  # -12dB default global volume
 globaltranspose = 0
 
 
@@ -135,13 +149,16 @@ def AudioCallback(in_data, frame_count, time_info, status):
 
 
 def MidiCallback(message, time_stamp):
-    global playingnotes
+    global playingnotes, sustain, sustainplayingnotes
     global preset
     messagetype = message[0] >> 4
     messagechannel = (message[0] & 15) + 1
     note = message[1] if len(message) > 1 else None
     midinote = note
     velocity = message[2] if len(message) > 2 else None
+
+    if messagetype == 9 and velocity == 0:
+        messagetype = 8
 
     if messagetype == 9:    # Note on
         midinote += globaltranspose
@@ -150,6 +167,30 @@ def MidiCallback(message, time_stamp):
         except:
             pass
 
+    # Commenting out as drums don't do on/off or sustain and I don't require the 'Program change' function. for now...
+    #elif messagetype == 8:  # Note off
+    #    midinote += globaltranspose
+    #    if midinote in playingnotes:
+    #        for n in playingnotes[midinote]:
+    #            if sustain:
+    #                sustainplayingnotes.append(n)
+    #            else:
+    #                n.fadeout(50)
+    #        playingnotes[midinote] = []
+    #
+    #elif messagetype == 12:  # Program change
+    #    print 'Program change ' + str(note)
+    #    preset = note
+    #    LoadSamples()
+    #
+    #elif (messagetype == 11) and (note == 64) and (velocity < 64):  # sustain pedal off
+    #    for n in sustainplayingnotes:
+    #        n.fadeout(50)
+    #    sustainplayingnotes = []
+    #    sustain = False
+    #
+    #elif (messagetype == 11) and (note == 64) and (velocity >= 64):  # sustain pedal on
+    #    sustain = True
 
 
 #########################################
@@ -186,7 +227,7 @@ def ActuallyLoad():
     global globalvelocitysensitivity
     playingsounds = []
     samples = {}
-    globalvolume = 10 ** (-25.0/20)  # -25dB default global volume
+    globalvolume = 10 ** (-24.0/20)  # -12dB default global volume
     globaltranspose = 0
     globalvelocitysensitivity = 0 # default midi velocity sensitivity
 
@@ -288,6 +329,104 @@ except:
         if dev['maxOutputChannels'] > 0:
             print str(i) + " -- " + dev['name']
     exit(1)
+
+
+#########################################
+# BUTTONS THREAD (RASPBERRY PI GPIO)
+#
+#########################################
+
+if USE_BUTTONS:
+    import RPi.GPIO as GPIO
+
+    lastbuttontime = 0
+
+    def Buttons():
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(18, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(17, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        global preset, lastbuttontime
+        while True:
+            now = time.time()
+            if not GPIO.input(18) and (now - lastbuttontime) > 0.2:
+                lastbuttontime = now
+                preset -= 1
+                if preset < 0:
+                    preset = 127
+                LoadSamples()
+
+            elif not GPIO.input(17) and (now - lastbuttontime) > 0.2:
+                lastbuttontime = now
+                preset += 1
+                if preset > 127:
+                    preset = 0
+                LoadSamples()
+
+            time.sleep(0.020)
+
+    ButtonsThread = threading.Thread(target=Buttons)
+    ButtonsThread.daemon = True
+    ButtonsThread.start()
+
+
+#########################################
+# 7-SEGMENT DISPLAY
+#
+#########################################
+
+if USE_I2C_7SEGMENTDISPLAY:
+    import smbus
+
+    bus = smbus.SMBus(1)     # using I2C
+
+    def display(s):
+        for k in '\x76\x79\x00' + s:     # position cursor at 0
+            try:
+                bus.write_byte(0x71, ord(k))
+            except:
+                try:
+                    bus.write_byte(0x71, ord(k))
+                except:
+                    pass
+            time.sleep(0.002)
+
+    display('----')
+    time.sleep(0.5)
+
+else:
+
+    def display(s):
+        pass
+
+
+#########################################
+# MIDI IN via SERIAL PORT
+#
+#########################################
+
+if USE_SERIALPORT_MIDI:
+    import serial
+
+    ser = serial.Serial('/dev/ttyAMA0', baudrate=38400)       # see hack in /boot/cmline.txt : 38400 is 31250 baud for MIDI!
+
+    def MidiSerialCallback():
+        message = [0, 0, 0]
+        while True:
+            i = 0
+            while i < 3:
+                data = ord(ser.read(1))  # read a byte
+                if data >> 7 != 0:
+                    i = 0      # status byte!   this is the beginning of a midi message: http://www.midi.org/techspecs/midimessages.php
+                message[i] = data
+                i += 1
+                if i == 2 and message[0] >> 4 == 12:  # program change: don't wait for a third byte: it has only 2 bytes
+                    message[2] = 0
+                    i = 3
+            MidiCallback(message, None)
+
+    MidiThread = threading.Thread(target=MidiSerialCallback)
+    MidiThread.daemon = True
+    MidiThread.start()
 
 
 #########################################
